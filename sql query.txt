@@ -1,0 +1,115 @@
+-- 1. Creating a database
+USE master;
+GO
+IF EXISTS (SELECT name FROM sys.databases WHERE name = 'ECommerceAnalytics')
+BEGIN
+    ALTER DATABASE ECommerceAnalytics SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE ECommerceAnalytics;
+END
+GO
+CREATE DATABASE ECommerceAnalytics;
+GO
+
+-- 2. Creating tables
+USE ECommerceAnalytics;
+GO
+
+-- Raw data table
+CREATE TABLE RawSalesData (
+    InvoiceNo VARCHAR(20),
+    StockCode VARCHAR(20),
+    Description VARCHAR(255),
+    Quantity INT,
+    InvoiceDate DATETIME,
+    UnitPrice DECIMAL(10, 2),
+    CustomerID VARCHAR(20),
+    Country VARCHAR(100),
+    LoadDate DATETIME DEFAULT GETDATE()
+);
+GO
+
+-- Cleaned data table
+CREATE TABLE CleanedSales (
+    SalesID INT IDENTITY(1,1) PRIMARY KEY,
+    InvoiceNo VARCHAR(20),
+    StockCode VARCHAR(20),
+    Description VARCHAR(255),
+    Quantity INT,
+    InvoiceDate DATETIME,
+    UnitPrice DECIMAL(10, 2),
+    CustomerID VARCHAR(20),
+    Country VARCHAR(100),
+    TotalAmount AS (Quantity * UnitPrice) PERSISTED,
+    LoadDate DATETIME DEFAULT GETDATE()
+);
+GO
+
+-- Dimensions tables
+CREATE TABLE DimCustomers (
+    CustomerKey INT IDENTITY(1,1) PRIMARY KEY,
+    CustomerID VARCHAR(20) UNIQUE,
+    FirstPurchaseDate DATETIME,
+    TotalOrders INT DEFAULT 0,
+    TotalSpent DECIMAL(18, 2) DEFAULT 0
+);
+GO
+
+CREATE TABLE DimProducts (
+    ProductKey INT IDENTITY(1,1) PRIMARY KEY,
+    StockCode VARCHAR(20) UNIQUE,
+    Description VARCHAR(255),
+    Category VARCHAR(100)
+);
+GO
+
+CREATE TABLE DimTime (
+    TimeKey INT PRIMARY KEY,
+    FullDate DATETIME,
+    Day INT,
+    Month INT,
+    Year INT,
+    Quarter INT,
+    DayOfWeek INT,
+    DayName VARCHAR(10),
+    MonthName VARCHAR(10),
+    IsWeekend BIT
+);
+GO
+
+-- Fact table
+CREATE TABLE FactSales (
+    SalesKey INT IDENTITY(1,1) PRIMARY KEY,
+    TimeKey INT REFERENCES DimTime(TimeKey),
+    CustomerKey INT REFERENCES DimCustomers(CustomerKey),
+    ProductKey INT REFERENCES DimProducts(ProductKey),
+    Quantity INT,
+    UnitPrice DECIMAL(10, 2),
+    TotalAmount DECIMAL(18, 2),
+    Country VARCHAR(100)
+);
+GO
+
+-- 3. Stored Procedures
+CREATE OR ALTER PROCEDURE sp_CleanAndTransferData
+AS
+BEGIN
+    INSERT INTO CleanedSales (
+        InvoiceNo, StockCode, Description, 
+        Quantity, InvoiceDate, UnitPrice, 
+        CustomerID, Country
+    )
+    SELECT 
+        InvoiceNo, 
+        UPPER(TRIM(StockCode)) AS StockCode,
+        LEFT(Description, 255) AS Description,
+        Quantity, 
+        InvoiceDate, 
+        UnitPrice,
+        CustomerID,
+        Country
+    FROM RawSalesData
+    WHERE Quantity > 0 AND UnitPrice > 0 AND CustomerID IS NOT NULL;
+    
+    SELECT @@ROWCOUNT AS 'RowsAffected';
+END;
+GO

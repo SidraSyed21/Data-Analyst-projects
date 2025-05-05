@@ -1,0 +1,199 @@
+import pandas as pd
+import pyodbc
+from datetime import datetime
+import time
+import numpy as np
+
+class ECommerceETL:
+    def __init__(self, db_name):
+        self.connection_string = (
+            f"Driver={{SQL Server}};"
+            f"Server=.;"
+            f"Database={db_name};"
+            f"Trusted_Connection=yes;"
+        )
+
+    def extract_from_csv(self, file_path):
+        try:
+            df = pd.read_csv(
+                file_path,
+                encoding='ISO-8859-1',
+                dtype={
+                    'InvoiceNo': 'str',
+                    'StockCode': 'str',
+                    'Description': 'str',
+                    'CustomerID': 'str',
+                    'Country': 'str'
+                },
+                parse_dates=['InvoiceDate']
+            )
+            initial_count = len(df)
+            df = df[df['CustomerID'].notna()]
+            print(f"{initial_count - len(df)} satır filtrelendi")
+            return df
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            return None
+
+    def clean_data(self, df):
+        df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0).astype('int32')
+        df['UnitPrice'] = pd.to_numeric(df['UnitPrice'], errors='coerce').fillna(0.0)
+        df = df[(df['Quantity'] > 0) & (df['UnitPrice'] > 0)]
+        df['Description'] = df['Description'].str.slice(0, 255)
+        df['StockCode'] = df['StockCode'].str.strip().str.upper()
+        return df
+
+    def load_to_sql(self, df, table_name, batch_size=1000):
+        try:
+            conn = pyodbc.connect(self.connection_string)
+            cursor = conn.cursor()
+            
+            insert_sql = f"""
+            INSERT INTO {table_name} (
+                InvoiceNo, StockCode, Description, 
+                Quantity, InvoiceDate, UnitPrice, 
+                CustomerID, Country
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            
+            for i in range(0, len(df), batch_size):
+                batch = df.iloc[i:i + batch_size]
+                data = [tuple(row) for row in batch.to_records(index=False)]
+                cursor.executemany(insert_sql, data)
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"SQL Error: {str(e)}")
+            return False
+
+    def execute_sql_procedure(self, procedure_name):
+        try:
+            conn = pyodbc.connect(self.connection_string)
+            cursor = conn.cursor()
+            cursor.execute(f"EXEC {procedure_name}")
+            result = cursor.fetchone()
+            conn.commit()
+            return result[0] if result else 0
+        except Exception as e:
+            print(f"Procedure Error: {str(e)}")
+            return None
+
+    def populate_dimensions(self):
+        try:
+            conn = pyodbc.connect(self.connection_string)
+            cursor = conn.cursor()
+            
+            # Müşteriler
+            cursor.execute("""
+            INSERT INTO DimCustomers (CustomerID, FirstPurchaseDate, TotalOrders, TotalSpent)
+            SELECT 
+                CustomerID,
+                MIN(InvoiceDate),
+                COUNT(DISTINCT InvoiceNo),
+                SUM(Quantity * UnitPrice)
+            FROM CleanedSales
+            GROUP BY CustomerID
+            """)
+            
+            # Products dimension (using MERGE)
+            cursor.execute("""
+            MERGE INTO DimProducts AS target
+            USING (
+                SELECT 
+                    StockCode,
+                    MAX(Description) AS Description,
+                    MAX(LEFT(Description, CHARINDEX(' ', Description + ' ') - 1) AS Category
+                FROM CleanedSales
+                GROUP BY StockCode
+            ) AS source
+            ON (target.StockCode = source.StockCode)
+            WHEN NOT MATCHED THEN
+                INSERT (StockCode, Description, Category)
+                VALUES (source.StockCode, source.Description, source.Category);
+            """)
+            
+            # Time dimension
+            cursor.execute("""
+            INSERT INTO DimTime (TimeKey, FullDate, Day, Month, Year, 
+                              Quarter, DayOfWeek, DayName, MonthName, IsWeekend)
+            SELECT DISTINCT
+                CONVERT(INT, CONVERT(VARCHAR, CAST(InvoiceDate AS DATE), 112)),
+                CAST(InvoiceDate AS DATE),
+                DAY(InvoiceDate),
+                MONTH(InvoiceDate),
+                YEAR(InvoiceDate),
+                DATEPART(QUARTER, InvoiceDate),
+                DATEPART(WEEKDAY, InvoiceDate),
+                DATENAME(WEEKDAY, InvoiceDate),
+                DATENAME(MONTH, InvoiceDate),
+                CASE WHEN DATEPART(WEEKDAY, InvoiceDate) IN (1, 7) THEN 1 ELSE 0 END
+            FROM CleanedSales
+            WHERE NOT EXISTS (
+                SELECT 1 FROM DimTime 
+                WHERE TimeKey = CONVERT(INT, CONVERT(VARCHAR, CAST(InvoiceDate AS DATE), 112))
+            """)
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Size Error: {str(e)}")
+            return False
+
+    def populate_facts(self):
+        try:
+            conn = pyodbc.connect(self.connection_string)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+            INSERT INTO FactSales (TimeKey, CustomerKey, ProductKey, 
+                                 Quantity, UnitPrice, TotalAmount, Country)
+            SELECT 
+                CONVERT(INT, CONVERT(VARCHAR, CAST(cs.InvoiceDate AS DATE), 112)),
+                dc.CustomerKey,
+                dp.ProductKey,
+                cs.Quantity,
+                cs.UnitPrice,
+                cs.Quantity * cs.UnitPrice,
+                cs.Country
+            FROM CleanedSales cs
+            JOIN DimCustomers dc ON cs.CustomerID = dc.CustomerID
+            JOIN DimProducts dp ON cs.StockCode = dp.StockCode
+            """)
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Fact Error: {str(e)}")
+            return False
+
+    def run_full_pipeline(self, csv_path):
+        start_time = time.time()
+        
+        # 1. Extract
+        raw_data = self.extract_from_csv(csv_path)
+        if raw_data is None: return False
+        
+        # 2. Clean
+        cleaned_data = self.clean_data(raw_data)
+        
+        # 3. Load
+        if not self.load_to_sql(cleaned_data, "RawSalesData"): return False
+        
+        # 4. Transform
+        cleaned_rows = self.execute_sql_procedure("sp_CleanAndTransferData")
+        if not cleaned_rows: return False
+        
+        # 5. Dimensions
+        if not self.populate_dimensions(): return False
+        
+        # 6. Facts
+        if not self.populate_facts(): return False
+        
+        duration = time.time() - start_time
+        print(f"ETL tamamlandı. Süre: {duration:.2f} saniye")
+        return True
+
+if __name__ == "__main__":
+    etl = ECommerceETL("ECommerceAnalytics")
+    success = etl.run_full_pipeline("data.csv")
+    print("Success!" if success else "Error occurred!")
